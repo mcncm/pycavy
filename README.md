@@ -1,5 +1,3 @@
-"""the Python interface to the Cavy compiler.
-
 The typical usage of this package is to create a Program object from some
 literal Cavy source code, then compile it and emit some circuit representation
 of the assembly code that can be executed on real or simulated hardware. For
@@ -44,10 +42,10 @@ q_2: ───────■─────────────────
                                       └───┘      └───┘└─────┘└───┘
 ```
 
+Cirq and Qiskit, as well as a few other packages, are optional dependencies to
+PyCavy. These aren't fully documented, as this package is intended for personal
+use at the moment. The optional dependencies can be found in `dependencies.py`
+
 The `compile` function may take more optional arguments in the future, in
 particular related to hardware-specific optimization. For now, it only takes an
 optional `opt` argument for optimization level, which may be 0, 1, 2, or 3.
-
-"""
-
-from pycavy.compilation import Program
