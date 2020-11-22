@@ -12,6 +12,14 @@ import tempfile
 
 import pycavy.dependencies as deps
 
+# Shell command to invoke the compiler
+cavy_cmd = "cavy"
+
+class CavyError(RuntimeError):
+    """A general exception type for errors emitted by the Cavy compiler
+    """
+    pass
+
 
 class Program:
     """An abstraction of a Cavy source file.
@@ -21,14 +29,24 @@ class Program:
         self.src_code = src
 
     def compile(self, opt: int = 0):
+
         # Write the Cavy source to a tempfile.
+        # TODO rewrite this with tempfile context managers
         (src_fd, src_path) = tempfile.mkstemp()
         with open(src_path, 'w') as src_file:
             src_file.write(self.src_code)
 
         # Compile the source, calling a `cavy` binary on the PATH
         (src_fd, obj_path) = tempfile.mkstemp()
-        subprocess.run(["cavy", src_path, "-o", obj_path, "-O", str(opt)])
+        proc = subprocess.run(
+            cavy_cmd.strip().split() +
+            [src_path, "-o", obj_path, "-O", str(opt)],
+            capture_output=True
+        )
+
+        if proc.returncode != 0:
+            os.unlink(src_path)
+            raise CavyError(proc.stderr.decode().strip())
 
         # Clean up the source file
         os.unlink(src_path)
@@ -56,7 +74,7 @@ class ObjectFile:
         return self.__obj_code
 
     @deps.require('qiskit')
-    def to_qiskit(self) -> "qiskit.Circuit":
+    def to_qiskit(self) -> "qiskit.QuantumCircuit":
         """Return the object code as a Qiskit circuit
         """
         from_qasm = deps.qiskit.QuantumCircuit.from_qasm_str
