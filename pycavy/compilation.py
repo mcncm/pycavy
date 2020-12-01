@@ -6,14 +6,18 @@
 # implementation of Cavy, and now serves as part of the Python interface to the
 # compiler.
 
+import json
 import os
 import subprocess
 import tempfile
+from abc import ABC, abstractmethod
+from typing import Any, Dict, Tuple
 
 import pycavy.dependencies as deps
 
 # Shell command to invoke the compiler
 cavy_cmd = "cavy"
+
 
 class CavyError(RuntimeError):
     """A general exception type for errors emitted by the Cavy compiler
@@ -64,9 +68,19 @@ class ObjectFile:
         # disappear when I (eventually) move to using a compiled Cavy library
         # distributed with the Python package
         with open(obj_path, 'r') as obj_file:
-            self.__obj_code = obj_file.read()
+            obj_code = obj_file.read()
         # Clean up the source file
         os.unlink(obj_path)
+        self.__bindings, self.__qasm = ObjectFile.__parse_asm(obj_code)
+        self.__prints = None
+
+    @classmethod
+    def __parse_asm(cls, qasm: str) -> Tuple[Dict, str]:
+        # The first line is expected to be a comment containing a bindings
+        # dictionary.
+        bindings, qasm = qasm.split(sep='\n', maxsplit=1)
+        bindings = json.loads(bindings.lstrip('//'))
+        return bindings, qasm
 
     def to_qasm(self) -> str:
         """Return the object code as a QASM string
@@ -78,7 +92,8 @@ class ObjectFile:
         """Return the object code as a Qiskit circuit
         """
         from_qasm = deps.qiskit.QuantumCircuit.from_qasm_str
-        return from_qasm(self.__obj_code)
+        circuit = from_qasm(self.__qasm)
+        return QiskitRunnable(circuit, self.__bindings, self.__prints)
 
     @deps.require('cirq')
     def to_cirq(self) -> "cirq.Circuit":
@@ -86,7 +101,8 @@ class ObjectFile:
         """
         cirq = deps.cirq
         from cirq.contrib.qasm_import import circuit_from_qasm
-        return circuit_from_qasm(self.__obj_code)
+        circuit = circuit_from_qasm(self.__qasm)
+        return CirqRunnable(circuit, self.__bindings, self.__prints)
 
     @deps.require('labber')
     def to_labber(self):
@@ -103,3 +119,100 @@ class ObjectFile:
         to_latex = deps.cirq.contrib.qcircuit.circuit_to_latex_using_qcircuit
         circuit = self.to_cirq()
         return to_latex(circuit, circuit.all_qubits())
+
+
+class Runnable(ABC):
+
+    @abstractmethod
+    def run(self) -> Dict[str, Any]:
+        pass
+
+
+class CirqRunnable(Runnable):
+
+    def __init__(self, circuit, bindings, prints):
+        opt = 0
+        if opt > 0:
+            self.circuit = deps.cirq.google.optimized_for_xmon(circuit)
+        else:
+            self.circuit = circuit
+        self.bindings = bindings
+        self.prints = prints
+
+    def sample_circuit(self):
+        def meas_index(measurements, i: int):
+            return measurements.get(str((i, 0))).transpose()[0]
+        results = deps.cirq.sample(self.circuit,
+                                   dtype=bool,
+                                   repetitions=1)
+        # Convert the pandas series to a dictionary.
+        # For now we're only doing a single repetition, hence the zero index.
+        values = results.data.values[0]
+        names = [int(name.split('_')[1]) for name in results.data]
+        measurements = dict(zip(names, values))
+        return measurements
+
+    def run(self) -> Dict[str, Any]:
+        measurements = self.sample_circuit()
+        des = Deserializer(measurements)
+        # Each value in the bindings dictionary is assumed to be a map from a
+        # type string to its data.
+        return {name: des.deserialize(value)
+                for name, value in self.bindings.items()}
+
+
+class QiskitRunnable(Runnable):
+
+    def __init__(self, circuit, bindings, prints):
+        self.circuit = circuit
+        self.bindings = bindings
+        self.prints = prints
+
+    def run(self) -> Dict[str, Any]:
+        raise NotImplementedError
+
+
+class Deserializer:
+    def __init__(self,  measurements: Dict[str, Dict[str, Any]]):
+        self.measurements = measurements
+        # A dispatch table mapping type names to deserialization functions.
+        self.d_table = {
+            'Bool': self.deserialize_classical,
+            'Q_Bool': self.deserialize_q_bool,
+            'Q_U8': self.deserialize_q_unsigned,
+            'Q_U16': self.deserialize_q_unsigned,
+            'Q_U32': self.deserialize_q_unsigned,
+            'Measured': self.deserialize_measured,
+        }
+
+    def deserialize(self, value: Dict[str, Any]) -> Any:
+        typ, data = self.split_value(value)
+        func = self.d_table.get(typ, self.deserialize_default)
+        return func(data)
+
+    def split_value(self, value: Dict[str, Any]) -> (str, Any):
+        """The values contained in the bindings dictionary are assumed to be maps from
+        type strings to the contained data; that is, dictionaries with a single
+        key-value pair.
+        """
+        return next(iter(value.items()))
+
+    def deserialize_classical(self, data: Any) -> Any:
+        return data
+
+    def deserialize_q_bool(self, data: int) -> bool:
+        bit = self.measurements[data]
+        return bool(bit)
+
+    def deserialize_q_unsigned(self, data: Any) -> int:
+        bits = [self.measurements[qb] for qb in data]
+        num = 0
+        for i, bit in enumerate(bits):
+            num += (1 << i) * bit
+        return num
+
+    def deserialize_measured(self, data: Dict[str, Any]) -> Any:
+        return self.deserialize(data)
+
+    def deserialize_default(self, data: Any) -> Any:
+        raise NotImplementedError
