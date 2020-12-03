@@ -11,7 +11,7 @@ import os
 import subprocess
 import tempfile
 from abc import ABC, abstractmethod
-from typing import Any, Dict, Tuple
+from typing import Any, Dict, Tuple, List
 
 import pycavy.dependencies as deps
 
@@ -182,6 +182,7 @@ class Deserializer:
             'Q_U8': self.deserialize_q_unsigned,
             'Q_U16': self.deserialize_q_unsigned,
             'Q_U32': self.deserialize_q_unsigned,
+            'Array': self.deserialize_array,
             'Measured': self.deserialize_measured,
         }
 
@@ -210,6 +211,9 @@ class Deserializer:
         for i, bit in enumerate(bits):
             num += (1 << i) * bit
         return num
+
+    def deserialize_array(self, data: List) -> int:
+        return [self.deserialize(item) for item in data]
 
     def deserialize_measured(self, data: Dict[str, Any]) -> Any:
         return self.deserialize(data)
