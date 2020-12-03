@@ -112,13 +112,14 @@ class ObjectFile:
         """
         raise NotImplementedError
 
-    @deps.require('cirq', 'pylatex')
+    @deps.require('cirq')
     def to_diagram(self) -> str:
         """Returns latex source for a circuit diagram
         """
         to_latex = deps.cirq.contrib.qcircuit.circuit_to_latex_using_qcircuit
-        circuit = self.to_cirq()
-        return to_latex(circuit, circuit.all_qubits())
+        circuit = self.to_cirq().circuit
+        circuit_latex = to_latex(circuit, circuit.all_qubits())
+        return Diagram(circuit_latex)
 
 
 class Runnable(ABC):
@@ -170,6 +171,39 @@ class QiskitRunnable(Runnable):
 
     def run(self) -> Dict[str, Any]:
         raise NotImplementedError
+
+
+class Diagram:
+
+    def __init__(self, circuit: str):
+        self.circuit = self.fixup_circuit(circuit)
+
+    def fixup_circuit(self, circuit: str):
+        """The LaTeX circuit comes out with some ugly labels on the left-hand-side.
+        Let's get rid of those with a simple regex. Of course, we don't know if
+        the API producing the circuit is stable, so this method might need to
+        change next time we upgrade Cirq.
+        """
+        import re
+
+        # You might want to write the names of things in braces at
+        # the end of the circuit or something
+        pattern = r'&\\lstick{\\text{q\\_\d+}}& \\qw'
+        circuit, _ = re.subn(pattern, '', circuit)
+        return circuit
+
+    @deps.require('pylatex')
+    def to_pdf(self, file_path: str):
+        from pylatex import Document, Package, NoEscape
+
+        doc = Document(documentclass='standalone')
+        doc.packages.append(Package('qcircuit'))
+        doc.packages.append(Package('physics'))
+        doc.packages.append(Package('amsmath'))
+        doc.append(NoEscape(self.circuit))
+
+        doc.generate_pdf(file_path)
+
 
 
 class Deserializer:
