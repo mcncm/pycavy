@@ -1,0 +1,18 @@
+[package]
+name = "pycavy-new"
+version = "0.1.0"
+authors = ["mcncm <33966432+mcncm@users.noreply.github.com>"]
+edition = "2018"
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[lib]
+name = "pycavy"
+crate-type = ["cdylib"]
+
+[dependencies]
+cavy = { path = "../cavy-rs/cavy" }
+
+[dependencies.pyo3]
+version = "0.13.1"
+features = ["extension-module"]
