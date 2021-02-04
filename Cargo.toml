@@ -11,6 +11,7 @@ name = "pycavy"
 crate-type = ["cdylib"]
 
 [dependencies]
+paste = "1.0"
 cavy = { path = "../cavy-rs/cavy" }
 
 [dependencies.pyo3]
