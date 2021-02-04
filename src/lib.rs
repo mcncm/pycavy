@@ -1,16 +1,15 @@
 use paste::paste;
-use pyo3::{create_exception, exceptions::PyException, prelude::*, wrap_pyfunction};
+use pyo3::{class::basic::PyObjectProtocol, create_exception, prelude::*};
 
 use cavy::{
     analysis,
+    arch::{Arch, MeasurementMode},
     cavy_errors::ErrorBuf,
     circuit::{self, Circuit},
     codegen,
-    compile::compile,
     context::{Context, CtxFmt},
     lowering, parser, scanner,
-    session::{Config, Phase},
-    source::SrcId,
+    session::{Config, Phase, PhaseConfig},
 };
 
 create_exception!(pycavy, CavyError, pyo3::exceptions::PyException);
@@ -54,8 +53,12 @@ macro_rules! gates {
                 fn new(qbs: [usize; $qbs] $(, $inv: bool)?) -> (Self, Gate) {
                     (Self { qbs $(, $inv)? }, Gate::new())
                 }
+            }
 
+            #[pyproto]
+            impl PyObjectProtocol for [<$name Gate>] {
                 fn __repr__(&self) -> PyResult<String> {
+                    #![allow(unused_variables)] // suppress warning for `inv`
                     let inv = "";
                     $(
                         // declared again here to appease linters that don't
@@ -83,43 +86,90 @@ gates! { m <
 }
 
 fn circuit_to_py(py: Python, circ: Circuit) -> PyResult<Vec<&PyAny>> {
-    let mut gates = vec![];
-    for gate in circ.circ_buf.into_iter() {
-        let pygate = match gate {
-            circuit::Gate::X(qb) => PyCell::new(py, HGate::new([qb])).unwrap().as_ref(),
-            circuit::Gate::T { tgt, conj } => {
-                PyCell::new(py, TGate::new([tgt], conj)).unwrap().as_ref()
-            }
-            circuit::Gate::H(qb) => PyCell::new(py, HGate::new([qb])).unwrap().as_ref(),
-            circuit::Gate::Z(qb) => PyCell::new(py, ZGate::new([qb])).unwrap().as_ref(),
-            circuit::Gate::CX { tgt, ctrl } => {
-                PyCell::new(py, CXGate::new([ctrl, tgt])).unwrap().as_ref()
-            }
-            circuit::Gate::M(_) => todo!(),
-        };
-        gates.push(pygate);
-    }
+    let transcribe_gate = |gate| match gate {
+        circuit::Gate::X(qb) => PyCell::new(py, HGate::new([qb])).unwrap().as_ref(),
+        circuit::Gate::T { tgt, conj } => {
+            PyCell::new(py, TGate::new([tgt], conj)).unwrap().as_ref()
+        }
+        circuit::Gate::H(qb) => PyCell::new(py, HGate::new([qb])).unwrap().as_ref(),
+        circuit::Gate::Z(qb) => PyCell::new(py, ZGate::new([qb])).unwrap().as_ref(),
+        circuit::Gate::CX { tgt, ctrl } => {
+            PyCell::new(py, CXGate::new([ctrl, tgt])).unwrap().as_ref()
+        }
+        circuit::Gate::M(_) => todo!(),
+    };
+
+    let gates = circ.circ_buf.into_iter().map(transcribe_gate).collect();
 
     Ok(gates)
 }
 
-#[pyclass]
-struct Session {
-    src: String,
+fn get_meas_mode(mode: &str) -> Result<MeasurementMode, ()> {
+    let mode = match mode {
+        "nondemolition" => MeasurementMode::Nondemolition,
+        "demolition" => MeasurementMode::Demolition,
+        _ => {
+            return Err(());
+        }
+    };
+    Ok(mode)
 }
 
+#[pyclass]
+struct Session {
+    conf: Config,
+}
+
+/// A Cavy compilation session, whose constructor accepts compiler options to
+/// customize device architecture and code generation behavior.
 #[pymethods]
 impl Session {
     #[new]
-    fn new(src: String) -> Self {
-        Self { src }
+    #[args(
+        opt = "3",
+        debug = "false",
+        qb_count = "None",
+        qram_size = "0",
+        meas_mode = "\"nondemolition\"",
+        feedback = "false"
+    )]
+    fn new(
+        opt: u8,
+        debug: bool,
+        // architecture options
+        qb_count: Option<usize>,
+        qram_size: usize,
+        meas_mode: &str,
+        feedback: bool,
+    ) -> Self {
+        let phase_config = PhaseConfig {
+            typecheck: true,
+            last_phase: Phase::Evaluate,
+        };
+        let meas_mode = get_meas_mode(meas_mode).unwrap();
+        let arch = Arch {
+            qb_count: qb_count.into(),
+            qram_size,
+            meas_mode,
+            feedback,
+        };
+        let conf = Config {
+            debug,
+            arch,
+            // This should be replaced with a "bare circuit" target, at which
+            // point we can replace the body of `compile_inner` with
+            // `cavy::compile::compile`.
+            target: Box::new(cavy::target::null::NullTarget {}),
+            opt,
+            phase_config,
+        };
+        Self { conf }
     }
 
-    fn compile<'a>(&self, py: Python<'a>) -> PyResult<Vec<&'a PyAny>> {
-        let conf = Config::default();
-        let mut ctx = Context::new(&conf);
+    fn compile<'a>(&self, py: Python<'a>, src: String) -> PyResult<Vec<&'a PyAny>> {
+        let mut ctx = Context::new(&self.conf);
 
-        match self.compile_inner(&mut ctx) {
+        match self.compile_inner(&mut ctx, src) {
             Ok(Some(circ)) => circuit_to_py(py, circ),
             Ok(None) => Ok(vec![]),
             Err(errs) => {
@@ -138,8 +188,8 @@ impl Session {
     /// it just calls `cavy::compile::compile`, which should return a
     /// `CodeObject` which is ideally just a `Vec<Gate>`. Then we map over it
     /// and return a list (or generator).
-    fn compile_inner(&self, ctx: &mut Context) -> Result<Option<Circuit>, ErrorBuf> {
-        let id = ctx.srcs.insert_input(&self.src);
+    fn compile_inner(&self, ctx: &mut Context, src: String) -> Result<Option<Circuit>, ErrorBuf> {
+        let id = ctx.srcs.insert_input(&src);
 
         let tokens = scanner::tokenize(id, ctx)?;
 
