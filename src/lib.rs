@@ -2,13 +2,10 @@ use paste::paste;
 use pyo3::{class::basic::PyObjectProtocol, create_exception, prelude::*};
 
 use cavy::{
-    analysis,
     arch::{Arch, MeasurementMode},
     cavy_errors::ErrorBuf,
     circuit::{self, Circuit},
-    codegen,
     context::{Context, CtxFmt},
-    lowering, parser, scanner,
     session::{Config, Phase, PhaseConfig},
 };
 
@@ -182,33 +179,9 @@ impl Session {
 }
 
 impl Session {
-    // Can I get a `Vec<Gate>`?
-    /// What this function should actually do is build a `Context` from the data
-    /// passed to it when setting parameters, then in this `compile` function,
-    /// it just calls `cavy::compile::compile`, which should return a
-    /// `CodeObject` which is ideally just a `Vec<Gate>`. Then we map over it
-    /// and return a list (or generator).
     fn compile_inner(&self, ctx: &mut Context, src: String) -> Result<Option<Circuit>, ErrorBuf> {
         let id = ctx.srcs.insert_input(&src);
-
-        let tokens = scanner::tokenize(id, ctx)?;
-
-        let ast = parser::parse(tokens, ctx)?;
-        if ctx.conf.debug && ctx.last_phase() == &Phase::Parse {
-            println!("{:#?}", ast);
-            return Ok(None);
-        }
-
-        let mir = lowering::lower(ast, ctx)?;
-        if ctx.conf.debug && ctx.last_phase() == &Phase::Typecheck {
-            println!("{}", mir.fmt_with(&ctx));
-            return Ok(None);
-        }
-
-        analysis::check(&mir, &ctx)?;
-
-        let circ = codegen::codegen(&mir, &ctx);
-        Ok(Some(circ))
+        cavy::compile::compile_circuit(id, ctx)
     }
 }
 
