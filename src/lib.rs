@@ -197,5 +197,6 @@ fn pycavy(py: Python, m: &PyModule) -> PyResult<()> {
     m.add_class::<CXGate>()?;
 
     m.add("CavyError", py.get_type::<CavyError>())?;
+    m.add("__version__", env!("CARGO_PKG_VERSION"))?;
     Ok(())
 }
