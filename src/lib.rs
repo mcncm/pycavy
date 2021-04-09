@@ -4,9 +4,9 @@ use pyo3::{class::basic::PyObjectProtocol, create_exception, prelude::*};
 use cavy::{
     arch::{Arch, MeasurementMode},
     cavy_errors::ErrorBuf,
-    circuit::{self, Circuit},
-    context::{Context, CtxFmt},
-    session::{Config, Phase, PhaseConfig},
+    circuit::{self, Lir},
+    context::{Context, CtxDisplay},
+    session::{Config, OptConfig, Phase, PhaseConfig},
 };
 
 create_exception!(pycavy, CavyError, pyo3::exceptions::PyException);
@@ -34,6 +34,7 @@ macro_rules! gates {
 
         paste! {
             #[pyclass(extends=Gate, subclass)]
+            /// A quantum gate implementing the named operation
             struct [<$name Gate>] {
                 // Could consider adding a `set` to this
                 #[pyo3(get)]
@@ -79,24 +80,28 @@ macro_rules! gates {
 }
 
 gates! { m <
-    H[1], Z[1], X[1], T[1] inv, CX[2]
+    H[1], Z[1], X[1], T[1] inv, CX[2], SWAP[2]
 }
 
-fn circuit_to_py(py: Python, circ: Circuit) -> PyResult<Vec<&PyAny>> {
+fn circuit_to_py(py: Python, circ: Lir) -> PyResult<Vec<&PyAny>> {
     let transcribe_gate = |gate| match gate {
-        circuit::Gate::X(qb) => PyCell::new(py, HGate::new([qb])).unwrap().as_ref(),
-        circuit::Gate::T { tgt, conj } => {
+        &circuit::Gate::X(qb) => PyCell::new(py, HGate::new([qb])).unwrap().as_ref(),
+        &circuit::Gate::T { tgt, conj } => {
             PyCell::new(py, TGate::new([tgt], conj)).unwrap().as_ref()
         }
-        circuit::Gate::H(qb) => PyCell::new(py, HGate::new([qb])).unwrap().as_ref(),
-        circuit::Gate::Z(qb) => PyCell::new(py, ZGate::new([qb])).unwrap().as_ref(),
-        circuit::Gate::CX { tgt, ctrl } => {
+        &circuit::Gate::H(qb) => PyCell::new(py, HGate::new([qb])).unwrap().as_ref(),
+        &circuit::Gate::Z(qb) => PyCell::new(py, ZGate::new([qb])).unwrap().as_ref(),
+        &circuit::Gate::CX { tgt, ctrl } => {
             PyCell::new(py, CXGate::new([ctrl, tgt])).unwrap().as_ref()
         }
-        circuit::Gate::M(_) => todo!(),
+        &circuit::Gate::M(_) => todo!(),
+        &circuit::Gate::SWAP { fst, snd } => {
+            PyCell::new(py, SWAPGate::new([fst, snd])).unwrap().as_ref()
+        }
     };
 
-    let gates = circ.circ_buf.into_iter().map(transcribe_gate).collect();
+    // What if there are infinitely many gates?
+    let gates = circ.iter().map(transcribe_gate).collect();
 
     Ok(gates)
 }
@@ -112,6 +117,25 @@ fn get_meas_mode(mode: &str) -> Result<MeasurementMode, ()> {
     Ok(mode)
 }
 
+fn get_phase(phase: Option<&str>) -> PhaseConfig {
+    let last_phase = match phase {
+        Some("tokenize") => Phase::Tokenize,
+        Some("parse") => Phase::Parse,
+        Some("typecheck") => Phase::Typecheck,
+        Some("analysis") => Phase::Analysis,
+        Some("optimization") => Phase::Optimization,
+        Some("translation") => Phase::Translation,
+        Some("codegen") => Phase::CodeGen,
+        Some(_) => unreachable!(),
+        None => Phase::CodeGen,
+    };
+
+    PhaseConfig {
+        last_phase,
+        typecheck: true,
+    }
+}
+
 #[pyclass]
 struct Session {
     conf: Config,
@@ -123,32 +147,40 @@ struct Session {
 impl Session {
     #[new]
     #[args(
-        opt = "3",
+        opt_level = "3",
+        comptime = "true",
         debug = "false",
         qb_count = "None",
         qram_size = "0",
         meas_mode = "\"nondemolition\"",
-        feedback = "false"
+        feedback = "false",
+        recursion = "false",
+        phase = "None"
     )]
     fn new(
-        opt: u8,
+        opt_level: u8,
+        comptime: bool,
         debug: bool,
         // architecture options
         qb_count: Option<usize>,
         qram_size: usize,
         meas_mode: &str,
         feedback: bool,
+        recursion: bool,
+        phase: Option<&str>,
     ) -> Self {
-        let phase_config = PhaseConfig {
-            typecheck: true,
-            last_phase: Phase::Evaluate,
-        };
+        let phase_config = get_phase(phase);
         let meas_mode = get_meas_mode(meas_mode).unwrap();
         let arch = Arch {
             qb_count: qb_count.into(),
             qram_size,
             meas_mode,
             feedback,
+            recursion,
+        };
+        let opt = OptConfig {
+            level: opt_level,
+            comptime,
         };
         let conf = Config {
             debug,
@@ -179,13 +211,13 @@ impl Session {
 }
 
 impl Session {
-    fn compile_inner(&self, ctx: &mut Context, src: String) -> Result<Option<Circuit>, ErrorBuf> {
+    fn compile_inner(&self, ctx: &mut Context, src: String) -> Result<Option<Lir>, ErrorBuf> {
         let id = ctx.srcs.insert_input(&src);
         cavy::compile::compile_circuit(id, ctx)
     }
 }
 
-/// A Python module implemented in Rust.
+/// the Python interface to the Cavylang compiler
 #[pymodule]
 fn pycavy(py: Python, m: &PyModule) -> PyResult<()> {
     m.add_class::<Session>()?;

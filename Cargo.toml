@@ -1,5 +1,5 @@
 [package]
-name = "pycavy-new"
+name = "pycavy"
 version = "0.1.0"
 authors = ["mcncm <33966432+mcncm@users.noreply.github.com>"]
 edition = "2018"
@@ -12,8 +12,9 @@ crate-type = ["cdylib"]
 paste = "1.0"
 
 [dependencies.cavy]
-path = "../cavy-rs/cavy"
-# Don't want to include comptime feature
+path = "../cavy-lang/cavy"
+# Don't want to include inline-cavy feature, which is useless without a Rust
+# compiler
 default-features = false
 
 [dependencies.pyo3]
