@@ -4,9 +4,10 @@ use pyo3::{class::basic::PyObjectProtocol, create_exception, prelude::*};
 use cavy::{
     arch::{Arch, MeasurementMode},
     cavy_errors::ErrorBuf,
-    circuit::{self, Lir},
-    context::{Context, CtxDisplay},
-    session::{Config, OptConfig, Phase, PhaseConfig},
+    circuit::{BaseGateQ, CircuitBuf, GateQ, Inst, Qbit},
+    context::Context,
+    session::{Config, OptConfig, OptFlags, Phase, PhaseConfig, Statistics},
+    util::FmtWith,
 };
 
 create_exception!(pycavy, CavyError, pyo3::exceptions::PyException);
@@ -22,15 +23,9 @@ impl Gate {
     }
 }
 
-macro_rules! drop_token {
-    (inv) => {};
-}
-
 macro_rules! gates {
-    ($module:ident < $($name:ident[$qbs:expr] $($inv:ident)?),*) => {
+    ($module:ident < $($name:ident[$qbs:expr]),*) => {
         $(
-        // Ensures that this token is literally `inv`
-        $(drop_token! { $inv })?
 
         paste! {
             #[pyclass(extends=Gate, subclass)]
@@ -39,35 +34,32 @@ macro_rules! gates {
                 // Could consider adding a `set` to this
                 #[pyo3(get)]
                 qbs: [usize; $qbs],
-                $(
-                // Also, macro expansion fails if we don't use this token.
-                $inv: bool,
-                )?
+            }
+
+            impl [<$name Gate>] {
+                fn pyobj<'p>(py: Python<'p>, qbs: [Qbit; $qbs]) -> &PyAny {
+                    let mut new_qbs = [0; $qbs];
+                    for i in 0..$qbs {
+                        new_qbs[i] = <u32>::from(qbs[i]) as usize;
+                    }
+                    PyCell::new(py, Self::new(new_qbs))
+                        .unwrap()
+                        .as_ref()
+                }
             }
 
             #[pymethods]
             impl [<$name Gate>] {
                 #[new]
-                fn new(qbs: [usize; $qbs] $(, $inv: bool)?) -> (Self, Gate) {
-                    (Self { qbs $(, $inv)? }, Gate::new())
+                fn new(qbs: [usize; $qbs]) -> (Self, Gate) {
+                    (Self { qbs }, Gate::new())
                 }
             }
 
             #[pyproto]
             impl PyObjectProtocol for [<$name Gate>] {
                 fn __repr__(&self) -> PyResult<String> {
-                    #![allow(unused_variables)] // suppress warning for `inv`
-                    let inv = "";
-                    $(
-                        // declared again here to appease linters that don't
-                        // handle macros very well
-                        let mut inv = "";
-                        drop_token! { $inv }
-                        if self.inv {
-                            inv = "+";
-                        }
-                    )?
-                    Ok(format!("{}{}{:?}", stringify!($name), inv, self.qbs))
+                    Ok(format!("{}{:?}", stringify!($name), self.qbs))
                 }
 
                 fn __str__(&self) -> PyResult<String> {
@@ -80,29 +72,46 @@ macro_rules! gates {
 }
 
 gates! { m <
-    H[1], Z[1], X[1], T[1] inv, CX[2], SWAP[2]
+    H[1], Z[1], X[1], T[1], TDag[1], CX[2], SWAP[2]
 }
 
-fn circuit_to_py(py: Python, circ: Lir) -> PyResult<Vec<&PyAny>> {
-    let transcribe_gate = |gate| match gate {
-        &circuit::Gate::X(qb) => PyCell::new(py, HGate::new([qb])).unwrap().as_ref(),
-        &circuit::Gate::T { tgt, conj } => {
-            PyCell::new(py, TGate::new([tgt], conj)).unwrap().as_ref()
-        }
-        &circuit::Gate::H(qb) => PyCell::new(py, HGate::new([qb])).unwrap().as_ref(),
-        &circuit::Gate::Z(qb) => PyCell::new(py, ZGate::new([qb])).unwrap().as_ref(),
-        &circuit::Gate::CX { tgt, ctrl } => {
-            PyCell::new(py, CXGate::new([ctrl, tgt])).unwrap().as_ref()
-        }
-        &circuit::Gate::M(_) => todo!(),
-        &circuit::Gate::SWAP { fst, snd } => {
-            PyCell::new(py, SWAPGate::new([fst, snd])).unwrap().as_ref()
+fn circuit_to_py(py: Python, circ: CircuitBuf) -> PyResult<Vec<&PyAny>> {
+    let transcribe_base_gate = |gate| match gate {
+        BaseGateQ::X(u) => XGate::pyobj(py, [u]),
+        BaseGateQ::T(u) => TGate::pyobj(py, [u]),
+        BaseGateQ::H(u) => HGate::pyobj(py, [u]),
+        BaseGateQ::Z(u) => ZGate::pyobj(py, [u]),
+        BaseGateQ::TDag(u) => TDagGate::pyobj(py, [u]),
+        BaseGateQ::Cnot { tgt, ctrl } => CXGate::pyobj(py, [ctrl, tgt]),
+        BaseGateQ::Swap(fst, snd) => SWAPGate::pyobj(py, [fst, snd]),
+    };
+
+    let transcribe_gate = |gate: GateQ| {
+        let base = transcribe_base_gate(gate.base);
+        if gate.ctrls.is_empty() {
+            base
+        } else {
+            // FIXME not handled yet
+            panic!();
         }
     };
 
     // What if there are infinitely many gates?
-    let gates = circ.iter().map(transcribe_gate).collect();
-
+    let gates = circ
+        .into_iter()
+        .filter_map(|inst| match inst {
+            Inst::CInit(_) => None,
+            Inst::CFree(_, _) => None,
+            Inst::QInit(_) => None,
+            Inst::QFree(_, _) => None,
+            Inst::QGate(gate) => Some(transcribe_gate(gate)),
+            Inst::CGate(_) => {
+                todo!()
+            }
+            Inst::Meas(_, _) => None,
+            Inst::Out(_) => None,
+        })
+        .collect();
     Ok(gates)
 }
 
@@ -136,6 +145,15 @@ fn get_phase(phase: Option<&str>) -> PhaseConfig {
     }
 }
 
+/// Convert an optional input to an opt flag value
+fn opt_flag(input: Option<bool>) -> i8 {
+    match input {
+        Some(true) => 1,
+        Some(false) => -1,
+        None => 0,
+    }
+}
+
 #[pyclass]
 struct Session {
     conf: Config,
@@ -148,7 +166,7 @@ impl Session {
     #[new]
     #[args(
         opt_level = "3",
-        comptime = "true",
+        const_prop = "None",
         debug = "false",
         qb_count = "None",
         qram_size = "0",
@@ -159,7 +177,7 @@ impl Session {
     )]
     fn new(
         opt_level: u8,
-        comptime: bool,
+        const_prop: Option<bool>,
         debug: bool,
         // architecture options
         qb_count: Option<usize>,
@@ -178,17 +196,15 @@ impl Session {
             feedback,
             recursion,
         };
+        let mut opt_flags = OptFlags::default();
+        opt_flags.const_prop = opt_flag(const_prop);
         let opt = OptConfig {
             level: opt_level,
-            comptime,
+            flags: opt_flags,
         };
         let conf = Config {
             debug,
             arch,
-            // This should be replaced with a "bare circuit" target, at which
-            // point we can replace the body of `compile_inner` with
-            // `cavy::compile::compile`.
-            target: Box::new(cavy::target::null::NullTarget {}),
             opt,
             phase_config,
         };
@@ -196,7 +212,8 @@ impl Session {
     }
 
     fn compile<'a>(&self, py: Python<'a>, src: String) -> PyResult<Vec<&'a PyAny>> {
-        let mut ctx = Context::new(&self.conf);
+        let mut stats = Statistics::new();
+        let mut ctx = Context::new(&self.conf, &mut stats);
 
         match self.compile_inner(&mut ctx, src) {
             Ok(Some(circ)) => circuit_to_py(py, circ),
@@ -211,7 +228,11 @@ impl Session {
 }
 
 impl Session {
-    fn compile_inner(&self, ctx: &mut Context, src: String) -> Result<Option<Lir>, ErrorBuf> {
+    fn compile_inner(
+        &self,
+        ctx: &mut Context,
+        src: String,
+    ) -> Result<Option<CircuitBuf>, ErrorBuf> {
         let id = ctx.srcs.insert_input(&src);
         cavy::compile::compile_circuit(id, ctx)
     }
